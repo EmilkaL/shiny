@@ -220,6 +220,15 @@ type BindInputsCtx = {
   maybeAddThemeObserver: (el: HTMLElement) => void;
   initDeferredIframes: () => void;
 };
+
+// Create a map to store the state of inputs by ID
+const inputStateCache: {
+  [key: string]: {
+    value: any;
+    timestamp: number;
+  };
+} = {};
+
 function bindInputs(
   shinyCtx: BindInputsCtx,
   scope: BindScope = document.documentElement
@@ -258,8 +267,34 @@ function bindInputs(
       const type = binding.getType(el);
       const effectiveId = type ? id + ":" + type : id;
 
+      // Check if we have a cached value for this input
+      let value;
+      if (inputStateCache[effectiveId] &&
+          Date.now() - inputStateCache[effectiveId].timestamp < 10000) { // 10 seconds cache validity
+        // Use cached value
+        value = inputStateCache[effectiveId].value;
+
+        // Try to restore the cached value using receiveMessage
+        try {
+          binding.receiveMessage(el, { value: value });
+        } catch (e) {
+          console.warn("Failed to restore cached value for input", effectiveId, e);
+          // If setting the value fails, get the current value
+          value = binding.getValue(el);
+        }
+      } else {
+        // Get fresh value
+        value = binding.getValue(el);
+      }
+
+      // Store the current value in the cache
+      inputStateCache[effectiveId] = {
+        value: value,
+        timestamp: Date.now()
+      };
+
       inputItems[effectiveId] = {
-        value: binding.getValue(el),
+        value: value,
         opts: {
           immediate: true,
           binding: binding,
@@ -271,8 +306,15 @@ function bindInputs(
       const thisCallback = (function () {
         const thisBinding = binding;
         const thisEl = el;
+        const thisId = effectiveId;
 
         return function (allowDeferred: boolean) {
+          // Update the cache when value changes
+          const value = thisBinding.getValue(thisEl);
+          inputStateCache[thisId] = {
+            value: value,
+            timestamp: Date.now()
+          };
           valueChangeCallback(inputs, thisBinding, thisEl, allowDeferred);
         };
       })();
@@ -477,8 +519,28 @@ async function bindAll(
 
   const inputs = shinyCtx.inputs;
 
+  // Keep track of which input IDs we've already processed in this binding session
+  // to avoid duplicate bindings and racing conditions
+  const processedIds = new Set<string>();
+
+  // When dealing with a mutable component (like a splitter) that rebuilds its DOM,
+  // we need to be careful about sending values to the server to avoid resetting inputs
   $.each(currentInputItems, function (name: string, item) {
-    inputs.setInput(name, item.value, item.opts);
+    // Only process each input ID once in this binding call
+    if (!processedIds.has(name)) {
+      processedIds.add(name);
+
+      // When we bind an input, only send the value to the server if:
+      // 1. It's a newly created input (not in our cache) or
+      // 2. The value has actually changed from what we have in the cache
+      const cachedItem = inputStateCache[name];
+      const needsUpdate = !cachedItem ||
+                         JSON.stringify(cachedItem.value) !== JSON.stringify(item.value);
+
+      if (needsUpdate) {
+        inputs.setInput(name, item.value, item.opts);
+      }
+    }
   });
 
   // Not sure if the iframe stuff is an intrinsic part of bindAll, but bindAll
